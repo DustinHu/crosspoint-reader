@@ -20,7 +20,6 @@ DictionaryLookupController::DictionaryLookupController(GfxRenderer& renderer, Ma
 void DictionaryLookupController::startLookup(const std::string& word) {
   lookupWord = word;
   foundWord.clear();
-  foundStemWord.clear();
   foundLocation = DictLocation{};
   lookupProgress = 0;
   lookupDone = false;
@@ -60,10 +59,22 @@ DictionaryLookupController::LookupEvent DictionaryLookupController::handleInput(
 
       if (foundLocation.found) {
         foundWord = lookupWord;
-        foundStatus = nextIsSuggestion ? FoundStatus::Suggestion : foundStemWord.empty() ? FoundStatus::Direct : FoundStatus::Stem;
-        if (!foundStemWord.empty()) foundWord = std::move(foundStemWord);
+        foundStatus = nextIsSuggestion ? FoundStatus::Suggestion : FoundStatus::Direct;
         nextIsSuggestion = false;
         return LookupEvent::FoundDefinition;
+      }
+
+      // Try stem variants (locate only — no definition loaded into RAM)
+      auto stems = Dictionary::getStemVariants(lookupWord);
+      for (const auto& stem : stems) {
+        auto loc = Dictionary::locate(stem, {}, cachePath.c_str());
+        if (loc.found) {
+          foundWord = stem;
+          foundLocation = std::move(loc);
+          foundStatus = nextIsSuggestion ? FoundStatus::Suggestion : FoundStatus::Stem;
+          nextIsSuggestion = false;
+          return LookupEvent::FoundDefinition;
+        }
       }
 
       // Try alt forms
@@ -234,21 +245,6 @@ void DictionaryLookupController::runLookup() {
   cbs.onProgress = nullptr;
   cbs.shouldCancel = &DictionaryLookupController::cancelCallback;
   foundLocation = Dictionary::locate(lookupWord, cbs, cachePath.c_str());
-
-  // If exact match not found, try stem variants in the same background task
-  if (!foundLocation.found && !lookupCancelRequested) {
-    auto stems = Dictionary::getStemVariants(lookupWord);
-    for (const auto& stem : stems) {
-      if (lookupCancelRequested) break;
-      auto loc = Dictionary::locate(stem, {}, cachePath.c_str());
-      if (loc.found) {
-        foundLocation = std::move(loc);
-        foundStemWord = stem;
-        break;
-      }
-    }
-  }
-
   lookupCancelled = lookupCancelRequested;
   lookupDone = true;
   owner.requestUpdate(true);
