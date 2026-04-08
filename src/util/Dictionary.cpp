@@ -523,7 +523,8 @@ DictLocation Dictionary::locate(const std::string& word, const DictLookupCallbac
     cpIdx.close();
   }
 
-  // Fallback: OFT page search + linear scan (for dictionaries not yet re-prepared)
+  // Fallback: OFT page search + linear scan (for dictionaries not yet re-prepared).
+  // TODO: Once all users have migrated to .idx.cp, this fallback can be removed.
   std::string p = result.folderPath + ".idx";
   FsFile idx;
   if (!Storage.openFileForRead("DICT", p.c_str(), idx)) return result;
