@@ -22,6 +22,58 @@ constexpr char GLOBAL_DICT_DIR[] = "/.crosspoint";
 static constexpr uint32_t OFT_HEADER_SIZE = 38;
 static constexpr uint32_t OFT_STRIDE = 32;  // words per page
 
+// Read a big-endian uint32 from a byte buffer (RISC-V alignment safe).
+static uint32_t readBE32(const uint8_t* buf) {
+  return (static_cast<uint32_t>(buf[0]) << 24) | (static_cast<uint32_t>(buf[1]) << 16) |
+         (static_cast<uint32_t>(buf[2]) << 8) | static_cast<uint32_t>(buf[3]);
+}
+
+// Buffered wrapper around FsFile for efficient sequential reads.
+// Reads IO_BUF_SIZE chunks from SD instead of single bytes, giving ~100x speedup.
+struct BufferedReader {
+  static constexpr int IO_BUF_SIZE = 512;
+  FsFile& file;
+  char ioBuf[IO_BUF_SIZE];
+  int bufPos = 0;
+  int bufLen = 0;
+
+  explicit BufferedReader(FsFile& f) : file(f) {}
+
+  void invalidate() {
+    bufPos = 0;
+    bufLen = 0;
+  }
+
+  int readByte() {
+    if (bufPos >= bufLen) {
+      bufLen = file.read(ioBuf, IO_BUF_SIZE);
+      bufPos = 0;
+      if (bufLen <= 0) return -1;
+    }
+    return static_cast<unsigned char>(ioBuf[bufPos++]);
+  }
+
+  // Read exactly n bytes into buf. Returns false if fewer than n bytes available.
+  bool readBytes(void* buf, int n) {
+    auto* dst = static_cast<uint8_t*>(buf);
+    for (int i = 0; i < n; ++i) {
+      int b = readByte();
+      if (b < 0) return false;
+      dst[i] = static_cast<uint8_t>(b);
+    }
+    return true;
+  }
+
+  uint32_t position() const { return static_cast<uint32_t>(file.position()) - (bufLen - bufPos); }
+
+  void seekSet(uint32_t pos) {
+    file.seekSet(pos);
+    invalidate();
+  }
+
+  bool eof() const { return bufPos >= bufLen && file.available() <= 0; }
+};
+
 // ---------------------------------------------------------------------------
 // Path management
 // ---------------------------------------------------------------------------
@@ -363,7 +415,44 @@ std::string Dictionary::readDefinition(const std::string& folderPath, uint32_t o
 }
 
 // ---------------------------------------------------------------------------
+// Binary search in .idx.cp — returns index of leftmost match, or -1
+// ---------------------------------------------------------------------------
+
+int32_t Dictionary::binarySearchIndex(FsFile& cpIdxFile, uint32_t entryCount, const char* word) {
+  int32_t lo = 0;
+  int32_t hi = static_cast<int32_t>(entryCount) - 1;
+  int32_t bestMatch = -1;
+
+  while (lo <= hi) {
+    int32_t mid = lo + (hi - lo) / 2;
+    size_t offset = SD_INDEX_HEADER_SIZE + static_cast<size_t>(mid) * sizeof(SdIndexEntry);
+    cpIdxFile.seekSet(offset);
+
+    SdIndexEntry entry;
+    if (cpIdxFile.read(&entry, sizeof(entry)) != static_cast<int>(sizeof(entry))) {
+      LOG_ERR("DICT", "Failed to read secondary index entry at %d", mid);
+      return -1;
+    }
+    entry.word[DICT_WORD_MAX - 1] = '\0';
+
+    int cmp = strncasecmp(word, entry.word, DICT_WORD_MAX - 1);
+    if (cmp == 0) {
+      bestMatch = mid;
+      hi = mid - 1;  // find leftmost match
+    } else if (cmp < 0) {
+      hi = mid - 1;
+    } else {
+      lo = mid + 1;
+    }
+  }
+
+  return bestMatch;
+}
+
+// ---------------------------------------------------------------------------
 // Locate (index search only — no definition read, zero RAM growth)
+// Uses .idx.cp secondary index for O(log n) binary search.
+// Falls back to OFT + linear scan if .idx.cp is not available.
 // ---------------------------------------------------------------------------
 
 DictLocation Dictionary::locate(const std::string& word, const DictLookupCallbacks& cbs, const char* cachePath) {
@@ -371,6 +460,70 @@ DictLocation Dictionary::locate(const std::string& word, const DictLookupCallbac
   result.folderPath = readDictPath(cachePath);
   if (result.folderPath.empty()) return result;
 
+  // Try .idx.cp secondary index first (O(log n) binary search)
+  std::string cpPath = result.folderPath + ".idx.cp";
+  FsFile cpIdx;
+  if (Storage.openFileForRead("DICT", cpPath.c_str(), cpIdx)) {
+    SdIndexHeader header;
+    if (cpIdx.read(&header, sizeof(header)) == static_cast<int>(sizeof(header)) &&
+        header.magic == SD_INDEX_MAGIC && header.version == SD_INDEX_VERSION) {
+      int32_t idx = binarySearchIndex(cpIdx, header.entryCount, word.c_str());
+      if (idx >= 0) {
+        // Walk adjacent entries sharing the same truncated prefix (handles words > 31 chars)
+        FsFile idxFile;
+        std::string idxPath = result.folderPath + ".idx";
+        bool idxOpen = false;
+
+        for (int32_t candidate = idx; candidate < static_cast<int32_t>(header.entryCount); ++candidate) {
+          if (cbs.shouldCancel && cbs.shouldCancel(cbs.ctx)) break;
+
+          size_t entryOffset = SD_INDEX_HEADER_SIZE + static_cast<size_t>(candidate) * sizeof(SdIndexEntry);
+          cpIdx.seekSet(entryOffset);
+          SdIndexEntry entry;
+          if (cpIdx.read(&entry, sizeof(entry)) != static_cast<int>(sizeof(entry))) break;
+          entry.word[DICT_WORD_MAX - 1] = '\0';
+
+          // Stop once truncated prefix no longer matches
+          if (strncasecmp(word.c_str(), entry.word, DICT_WORD_MAX - 1) != 0) break;
+
+          // For short words, the truncated word is the full word.
+          // For words that may have been truncated (fills all 31 chars), verify from .idx.
+          int truncLen = static_cast<int>(strlen(entry.word));
+          if (truncLen >= DICT_WORD_MAX - 1) {
+            if (!idxOpen) {
+              idxOpen = Storage.openFileForRead("DICT", idxPath.c_str(), idxFile);
+              if (!idxOpen) continue;
+            }
+            idxFile.seekSet(entry.idxWordOffset);
+            char fullWord[256];
+            int fwLen = 0;
+            while (fwLen < 255) {
+              uint8_t b;
+              if (idxFile.read(&b, 1) != 1 || b == 0) break;
+              fullWord[fwLen++] = static_cast<char>(b);
+            }
+            fullWord[fwLen] = '\0';
+            if (strcasecmp(word.c_str(), fullWord) != 0) continue;
+          } else {
+            if (strcasecmp(word.c_str(), entry.word) != 0) continue;
+          }
+
+          result.offset = entry.dictOffset;
+          result.size = entry.dictSize;
+          result.found = true;
+          break;
+        }
+
+        if (idxOpen) idxFile.close();
+      }
+      cpIdx.close();
+      if (cbs.onProgress) cbs.onProgress(cbs.ctx, 100);
+      return result;
+    }
+    cpIdx.close();
+  }
+
+  // Fallback: OFT page search + linear scan (for dictionaries not yet re-prepared)
   std::string p = result.folderPath + ".idx";
   FsFile idx;
   if (!Storage.openFileForRead("DICT", p.c_str(), idx)) return result;
@@ -404,10 +557,8 @@ DictLocation Dictionary::locate(const std::string& word, const DictLookupCallbac
 
     int cmp = cistrcmp(wordBuf, word.c_str());
     if (cmp == 0) {
-      result.offset = (static_cast<uint32_t>(suffix[0]) << 24) | (static_cast<uint32_t>(suffix[1]) << 16) |
-                      (static_cast<uint32_t>(suffix[2]) << 8) | static_cast<uint32_t>(suffix[3]);
-      result.size = (static_cast<uint32_t>(suffix[4]) << 24) | (static_cast<uint32_t>(suffix[5]) << 16) |
-                    (static_cast<uint32_t>(suffix[6]) << 8) | static_cast<uint32_t>(suffix[7]);
+      result.offset = readBE32(suffix);
+      result.size = readBE32(suffix + 4);
       result.found = true;
       idx.close();
       if (cbs.onProgress) cbs.onProgress(cbs.ctx, 100);
@@ -823,4 +974,137 @@ std::vector<std::string> Dictionary::findSimilar(const std::string& word, int ma
     results.push_back(candidates[i].text);
   }
   return results;
+}
+
+// ---------------------------------------------------------------------------
+// Secondary index (.idx.cp) generation — two-pass scan of StarDict .idx
+// ---------------------------------------------------------------------------
+
+bool Dictionary::generateIndex(const char* idxPath, const char* cpIdxPath, bool& outCorrupt,
+                               void* ctx, void (*progressCb)(void*, size_t, size_t),
+                               bool (*cancelCb)(void*)) {
+  outCorrupt = false;
+
+  FsFile idxFile;
+  if (!Storage.openFileForRead("DICT", idxPath, idxFile)) return false;
+  uint32_t idxSize = static_cast<uint32_t>(idxFile.fileSize());
+
+  BufferedReader reader(idxFile);
+
+  // First pass: count entries to write header
+  uint32_t entryCount = 0;
+  reader.seekSet(0);
+  while (!reader.eof()) {
+    // Read null-terminated word
+    int wordLen = 0;
+    while (true) {
+      int b = reader.readByte();
+      if (b < 0) goto countDone;
+      if (b == 0) break;
+      wordLen++;
+      if (wordLen > 255) {
+        LOG_ERR("DICT", "Word exceeds 255 bytes at entry %u", entryCount);
+        outCorrupt = true;
+        idxFile.close();
+        return false;
+      }
+    }
+    if (wordLen == 0) {
+      outCorrupt = true;
+      idxFile.close();
+      return false;
+    }
+
+    // Skip 8 bytes (offset + size, both uint32 big-endian)
+    uint8_t skip[8];
+    if (!reader.readBytes(skip, 8)) {
+      LOG_ERR("DICT", "Unexpected EOF reading offset/size at entry %u", entryCount);
+      outCorrupt = true;
+      idxFile.close();
+      return false;
+    }
+    entryCount++;
+  }
+countDone:
+
+  if (entryCount == 0) {
+    LOG_ERR("DICT", "StarDict .idx is empty: %s", idxPath);
+    outCorrupt = true;
+    idxFile.close();
+    return false;
+  }
+
+  // Second pass: write secondary index
+  FsFile cpFile;
+  if (!Storage.openFileForWrite("DICT", cpIdxPath, cpFile)) {
+    idxFile.close();
+    return false;
+  }
+
+  SdIndexHeader header;
+  header.magic = SD_INDEX_MAGIC;
+  header.version = SD_INDEX_VERSION;
+  header.idxFileSize = idxSize;
+  header.entryCount = entryCount;
+  if (cpFile.write(&header, sizeof(header)) != sizeof(header)) {
+    LOG_ERR("DICT", "Failed to write secondary index header");
+    cpFile.close();
+    idxFile.close();
+    return false;
+  }
+
+  reader.seekSet(0);
+  char wordBuf[256];
+  size_t lastProgressPos = 0;
+  constexpr size_t PROGRESS_INTERVAL = 65536;
+
+  for (uint32_t i = 0; i < entryCount; ++i) {
+    if (cancelCb && cancelCb(ctx)) {
+      cpFile.close();
+      idxFile.close();
+      return false;
+    }
+
+    uint32_t wordStart = reader.position();
+
+    // Read null-terminated word
+    int wordLen = 0;
+    while (true) {
+      int b = reader.readByte();
+      if (b < 0 || b == 0) break;
+      if (wordLen < 255) wordBuf[wordLen] = static_cast<char>(b);
+      wordLen++;
+    }
+    int truncLen = (wordLen < DICT_WORD_MAX - 1) ? wordLen : DICT_WORD_MAX - 1;
+
+    // Read offset and size (big-endian)
+    uint8_t raw[8];
+    if (!reader.readBytes(raw, 8)) break;
+
+    SdIndexEntry entry;
+    memset(&entry, 0, sizeof(entry));
+    memcpy(entry.word, wordBuf, truncLen);
+    entry.word[truncLen] = '\0';
+    entry.dictOffset = readBE32(raw);
+    entry.dictSize = readBE32(raw + 4);
+    entry.idxWordOffset = wordStart;
+
+    if (cpFile.write(&entry, sizeof(entry)) != sizeof(entry)) {
+      LOG_ERR("DICT", "Failed to write secondary index entry %u", i);
+      cpFile.close();
+      idxFile.close();
+      return false;
+    }
+
+    // Periodic progress update
+    size_t pos = reader.position();
+    if (progressCb && pos - lastProgressPos >= PROGRESS_INTERVAL) {
+      lastProgressPos = pos;
+      progressCb(ctx, pos, idxSize);
+    }
+  }
+
+  cpFile.close();
+  idxFile.close();
+  return true;
 }

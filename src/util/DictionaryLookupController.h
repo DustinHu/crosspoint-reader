@@ -97,6 +97,7 @@ class DictionaryLookupController {
 
   std::string lookupWord;
   std::string foundWord;
+  std::string foundStemWord;  // Set by background task if stem match found
   DictLocation foundLocation;
   std::string altFormWord;
 

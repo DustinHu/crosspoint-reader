@@ -20,13 +20,13 @@ DictionaryLookupController::DictionaryLookupController(GfxRenderer& renderer, Ma
 void DictionaryLookupController::startLookup(const std::string& word) {
   lookupWord = word;
   foundWord.clear();
+  foundStemWord.clear();
   foundLocation = DictLocation{};
   lookupProgress = 0;
   lookupDone = false;
   lookupCancelled = false;
   lookupCancelRequested = false;
   state = LookupState::LookingUp;
-  owner.requestUpdateAndWait();
   xTaskCreate(taskEntry, "DictLookup", 4096, this, 1, &taskHandle);
 }
 
@@ -60,22 +60,10 @@ DictionaryLookupController::LookupEvent DictionaryLookupController::handleInput(
 
       if (foundLocation.found) {
         foundWord = lookupWord;
-        foundStatus = nextIsSuggestion ? FoundStatus::Suggestion : FoundStatus::Direct;
+        foundStatus = nextIsSuggestion ? FoundStatus::Suggestion : foundStemWord.empty() ? FoundStatus::Direct : FoundStatus::Stem;
+        if (!foundStemWord.empty()) foundWord = std::move(foundStemWord);
         nextIsSuggestion = false;
         return LookupEvent::FoundDefinition;
-      }
-
-      // Try stem variants (locate only — no definition loaded into RAM)
-      auto stems = Dictionary::getStemVariants(lookupWord);
-      for (const auto& stem : stems) {
-        auto loc = Dictionary::locate(stem, {}, cachePath.c_str());
-        if (loc.found) {
-          foundWord = stem;
-          foundLocation = std::move(loc);
-          foundStatus = nextIsSuggestion ? FoundStatus::Suggestion : FoundStatus::Stem;
-          nextIsSuggestion = false;
-          return LookupEvent::FoundDefinition;
-        }
       }
 
       // Try alt forms
@@ -141,12 +129,7 @@ bool DictionaryLookupController::render() {
   const auto& metrics = UITheme::getInstance().getMetrics();
 
   if (state == LookupState::LookingUp) {
-    Rect popupLayout = GUI.drawPopup(renderer, tr(STR_DICT_LOOKING_UP));
-    if (lookupProgress > 0) {
-      GUI.fillPopupProgress(renderer, popupLayout, lookupProgress);
-    }
-    renderer.displayBuffer(HalDisplay::FAST_REFRESH);
-    return true;
+    return false;  // Let the activity render normally while lookup runs in background
   }
 
   if (state == LookupState::AltFormPrompt) {
@@ -248,9 +231,24 @@ bool DictionaryLookupController::cancelCallback(void* ctx) {
 void DictionaryLookupController::runLookup() {
   DictLookupCallbacks cbs;
   cbs.ctx = this;
-  cbs.onProgress = &DictionaryLookupController::progressCallback;
+  cbs.onProgress = nullptr;
   cbs.shouldCancel = &DictionaryLookupController::cancelCallback;
   foundLocation = Dictionary::locate(lookupWord, cbs, cachePath.c_str());
+
+  // If exact match not found, try stem variants in the same background task
+  if (!foundLocation.found && !lookupCancelRequested) {
+    auto stems = Dictionary::getStemVariants(lookupWord);
+    for (const auto& stem : stems) {
+      if (lookupCancelRequested) break;
+      auto loc = Dictionary::locate(stem, {}, cachePath.c_str());
+      if (loc.found) {
+        foundLocation = std::move(loc);
+        foundStemWord = stem;
+        break;
+      }
+    }
+  }
+
   lookupCancelled = lookupCancelRequested;
   lookupDone = true;
   owner.requestUpdate(true);

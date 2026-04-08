@@ -11,7 +11,7 @@
 // Activity that performs one or more dictionary preparation steps:
 //   1. Extract .dict.dz → .dict  (if .dict.dz present and .dict absent)
 //   2. Extract .syn.dz  → .syn   (if .syn.dz  present and .syn  absent)
-//   3. Generate .idx.oft from .idx  (if .idx present and .idx.oft absent)
+//   3. Generate .idx.cp from .idx  (if .idx present and .idx.cp absent)
 //   4. Generate .syn.oft from .syn  (if .syn present and .syn.oft absent)
 //
 // Shows a confirmation screen listing required steps with time/charger warnings,

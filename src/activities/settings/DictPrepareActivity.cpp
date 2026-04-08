@@ -12,6 +12,7 @@
 #include "MappedInputManager.h"
 #include "components/UITheme.h"
 #include "fontIds.h"
+#include "util/Dictionary.h"
 
 // ---------------------------------------------------------------------------
 // uzlib read callback context
@@ -117,14 +118,14 @@ void DictPrepareActivity::detectSteps() {
   const bool synDzExists = Storage.exists(pathBuf);
   snprintf(pathBuf, sizeof(pathBuf), "%s.idx", folderPath.c_str());
   const bool idxExists = Storage.exists(pathBuf);
-  snprintf(pathBuf, sizeof(pathBuf), "%s.idx.oft", folderPath.c_str());
-  const bool idxOftExists = Storage.exists(pathBuf);
+  snprintf(pathBuf, sizeof(pathBuf), "%s.idx.cp", folderPath.c_str());
+  const bool idxCpExists = Storage.exists(pathBuf);
   snprintf(pathBuf, sizeof(pathBuf), "%s.syn.oft", folderPath.c_str());
   const bool synOftExists = Storage.exists(pathBuf);
 
   if (!dictExists && dzExists) steps[stepCount++] = {StepType::EXTRACT_DICT};
   if (!synExists && synDzExists) steps[stepCount++] = {StepType::EXTRACT_SYN};
-  if (idxExists && !idxOftExists) steps[stepCount++] = {StepType::GEN_IDX};
+  if (idxExists && !idxCpExists) steps[stepCount++] = {StepType::GEN_IDX};
   const bool synWillExist = synExists || synDzExists;
   if (synWillExist && !synOftExists) steps[stepCount++] = {StepType::GEN_SYN};
 }
@@ -228,10 +229,22 @@ void DictPrepareActivity::runSteps() {
         if (!ok) Storage.remove((folderPath + ".syn").c_str());
         break;
 
-      case StepType::GEN_IDX:
-        ok = generateOft((folderPath + ".idx").c_str(), (folderPath + ".idx.oft").c_str(), 8, steps[i]);
-        if (!ok) Storage.remove((folderPath + ".idx.oft").c_str());
+      case StepType::GEN_IDX: {
+        bool corrupt = false;
+        ok = Dictionary::generateIndex(
+            (folderPath + ".idx").c_str(), (folderPath + ".idx.cp").c_str(), corrupt, this,
+            [](void* ctx, size_t progress, size_t total) {
+              auto* self = static_cast<DictPrepareActivity*>(ctx);
+              self->steps[self->currentStep].progress = progress;
+              self->steps[self->currentStep].total = total;
+              self->requestUpdate(true);
+            },
+            [](void* ctx) -> bool {
+              return static_cast<DictPrepareActivity*>(ctx)->cancelRequested;
+            });
+        if (!ok) Storage.remove((folderPath + ".idx.cp").c_str());
         break;
+      }
 
       case StepType::GEN_SYN:
         ok = generateOft((folderPath + ".syn").c_str(), (folderPath + ".syn.oft").c_str(), 4, steps[i]);

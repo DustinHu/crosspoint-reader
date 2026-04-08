@@ -13,6 +13,34 @@ struct DictLookupCallbacks {
   bool (*shouldCancel)(void* ctx) = nullptr;
 };
 
+// ---------------------------------------------------------------------------
+// Secondary index (.idx.cp) — generated from StarDict .idx for O(log n) binary search.
+// NOTE: Do NOT use __attribute__((packed)) — ESP32-C3 RISC-V faults on unaligned access.
+// These structs are naturally aligned (char[] + uint32_t).
+// ---------------------------------------------------------------------------
+static constexpr int DICT_WORD_MAX = 32;
+static constexpr uint32_t SD_INDEX_MAGIC = 0x43504958;  // "CPIX"
+static constexpr uint32_t SD_INDEX_VERSION = 1;
+static constexpr int SD_INDEX_HEADER_SIZE = 16;
+static constexpr int SD_INDEX_ENTRY_SIZE = 44;
+
+struct SdIndexHeader {
+  uint32_t magic;
+  uint32_t version;
+  uint32_t idxFileSize;  // StarDict .idx file size (for invalidation)
+  uint32_t entryCount;
+};
+static_assert(sizeof(SdIndexHeader) == SD_INDEX_HEADER_SIZE,
+              "SdIndexHeader size mismatch — update SD_INDEX_HEADER_SIZE");
+
+struct SdIndexEntry {
+  char word[DICT_WORD_MAX];  // 32 bytes, truncated for binary search comparison
+  uint32_t dictOffset;       // Byte offset into .dict (converted from BE on generation)
+  uint32_t dictSize;         // Byte size of definition in .dict
+  uint32_t idxWordOffset;    // Byte offset of full word in StarDict .idx (for >31 char verification)
+};
+static_assert(sizeof(SdIndexEntry) == SD_INDEX_ENTRY_SIZE, "SdIndexEntry size mismatch — update SD_INDEX_ENTRY_SIZE");
+
 // Metadata parsed from a StarDict .ifo file.
 struct DictInfo {
   char bookname[128] = "";
@@ -85,6 +113,15 @@ class Dictionary {
   // Requires .idx to be accessible; uses .idx.oft if present for neighbourhood search.
   static std::vector<std::string> findSimilar(const std::string& word, int maxResults, const char* cachePath = nullptr);
 
+  // Generate secondary index (.idx.cp) from StarDict .idx for O(log n) binary search.
+  // outCorrupt is set to true if the .idx file has structural problems.
+  // progressCb is called periodically with (ctx, bytesProcessed, totalBytes).
+  // cancelCb returns true to abort generation.
+  static bool generateIndex(const char* idxPath, const char* cpIdxPath, bool& outCorrupt,
+                            void* ctx = nullptr,
+                            void (*progressCb)(void*, size_t, size_t) = nullptr,
+                            bool (*cancelCb)(void*) = nullptr);
+
  private:
   // Shared word read buffer. Lookup functions are single-threaded; this avoids
   // putting a 256-byte array on the stack in every caller (and 512B peak when nested).
@@ -100,9 +137,13 @@ class Dictionary {
 
   static std::string readDefinition(const std::string& folderPath, uint32_t offset, uint32_t size);
 
+  // Binary search .idx.cp to find the entry matching word. Returns index or -1.
+  static int32_t binarySearchIndex(FsFile& cpIdxFile, uint32_t entryCount, const char* word);
+
   // Binary search .oft to find the page boundary bytes in src containing target.
   // On return, *startByte and *endByte delimit the 32-word page to scan linearly.
   // srcFileSize is used as the upper bound when the page is the last one.
+  // Used by findSimilar() and resolveAltForm() which still use OFT files.
   static void findPageBounds(FsFile& oft, FsFile& src, uint32_t srcFileSize, const char* target, uint32_t* startByte,
                              uint32_t* endByte);
 
